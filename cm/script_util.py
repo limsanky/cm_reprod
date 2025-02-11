@@ -11,15 +11,16 @@ def cm_train_defaults():
     return dict(
         teacher_model_path="",
         teacher_dropout=0.1,
-        training_mode="consistency_distillation",
+        training_mode="custom_isolation",
         target_ema_mode="fixed",
-        scale_mode="fixed",
+        scale_mode="ict",
         total_training_steps=600000,
         start_ema=0.0,
         start_scales=40,
         end_scales=40,
         distill_steps_per_iter=50000,
         loss_norm="lpips",
+        pred_mode='ve',
     )
 
 
@@ -30,15 +31,17 @@ def model_and_diffusion_defaults():
     res = dict(
         sigma_min=0.002,
         sigma_max=80.0,
+        sigma_data=0.5,
+        cov_xy=0.0,
         image_size=64,
         num_channels=128,
         num_res_blocks=2,
         num_heads=4,
         num_heads_upsample=-1,
         num_head_channels=-1,
-        attention_resolutions="32,16,8",
+        attention_resolutions="2,4",
         channel_mult="",
-        dropout=0.0,
+        dropout=0.1,
         class_cond=False,
         use_checkpoint=False,
         use_scale_shift_norm=True,
@@ -46,7 +49,9 @@ def model_and_diffusion_defaults():
         use_fp16=False,
         use_new_attention_order=False,
         learn_sigma=False,
-        weight_schedule="karras",
+        weight_schedule="cm_bridge_karras_until_x0",
+        is_n2i=True,
+        condition_mode='concat',
     )
     return res
 
@@ -72,11 +77,17 @@ def create_model_and_diffusion(
     sigma_min=0.002,
     sigma_max=80.0,
     distillation=False,
+    sigma_data=0.5,
+    sigma_data_end=0.5,
+    cov_xy=0.0,
+    is_n2i=True,
+    condition_mode='concat',
 ):
     model = create_model(
         image_size,
         num_channels,
         num_res_blocks,
+        condition_mode=condition_mode,
         channel_mult=channel_mult,
         learn_sigma=learn_sigma,
         class_cond=class_cond,
@@ -91,12 +102,19 @@ def create_model_and_diffusion(
         use_fp16=use_fp16,
         use_new_attention_order=use_new_attention_order,
     )
+    assert sigma_data == 0.5
+    if is_n2i:
+        sigma_data_end = np.sqrt(sigma_data**2 + sigma_max**2)
+        cov_xy = sigma_data**2
     diffusion = KarrasDenoiser(
-        sigma_data=0.5,
+        sigma_data=sigma_data,
         sigma_max=sigma_max,
         sigma_min=sigma_min,
         distillation=distillation,
         weight_schedule=weight_schedule,
+        sigma_data_end=sigma_data_end,
+        cov_xy=cov_xy,
+        is_n2i=is_n2i,
     )
     return model, diffusion
 
@@ -105,6 +123,7 @@ def create_model(
     image_size,
     num_channels,
     num_res_blocks,
+    condition_mode,
     channel_mult="",
     learn_sigma=False,
     class_cond=False,
@@ -128,6 +147,8 @@ def create_model(
             channel_mult = (1, 1, 2, 3, 4)
         elif image_size == 64:
             channel_mult = (1, 2, 3, 4)
+        elif image_size == 32:
+            channel_mult = (1, 2, 4)
         else:
             raise ValueError(f"unsupported image size: {image_size}")
     else:
@@ -155,6 +176,7 @@ def create_model(
         use_scale_shift_norm=use_scale_shift_norm,
         resblock_updown=resblock_updown,
         use_new_attention_order=use_new_attention_order,
+        cond=condition_mode,
     )
 
 
@@ -211,6 +233,17 @@ def create_ema_and_scales_fn(
             scales = np.where(scales == 2, sub_scales, scales)
 
             target_ema = 1.0
+        elif target_ema_mode == "fixed" and scale_mode == "ict":
+            assert step is not None
+            total_training_steps_prime = np.floor(
+                    total_steps
+                    / (np.log2(np.floor(end_scales / start_scales)) + 1)
+                )
+            num_timesteps = start_scales * np.power(
+                2, np.floor(step / total_training_steps_prime)
+            )
+            scales = min(num_timesteps, end_scales) + 1
+            target_ema = start_ema
         else:
             raise NotImplementedError
 

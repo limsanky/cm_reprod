@@ -341,7 +341,8 @@ class QKVFlashAttention(nn.Module):
         **kwargs,
     ) -> None:
         from einops import rearrange
-        from flash_attn.flash_attention import FlashAttention
+        # from flash_attn.flash_attention import FlashAttention
+        from flash_attn.modules.mha import FlashSelfAttention
 
         assert batch_first
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -356,8 +357,9 @@ class QKVFlashAttention(nn.Module):
         self.head_dim = self.embed_dim // num_heads
         assert self.head_dim in [16, 32, 64], "Only support head_dim == 16, 32, or 64"
 
-        self.inner_attn = FlashAttention(
-            attention_dropout=attention_dropout, **factory_kwargs
+        # self.inner_attn = FlashAttention(
+        self.inner_attn = FlashSelfAttention(
+            attention_dropout=attention_dropout, #**factory_kwargs
         )
         self.rearrange = rearrange
 
@@ -365,10 +367,16 @@ class QKVFlashAttention(nn.Module):
         qkv = self.rearrange(
             qkv, "b (three h d) s -> b s three h d", three=3, h=self.num_heads
         )
-        qkv, _ = self.inner_attn(
+        # qkv, _ = self.inner_attn(
+        #     qkv,
+        #     key_padding_mask=key_padding_mask,
+        #     need_weights=need_weights,
+        #     causal=self.causal,
+        # )
+        qkv = self.inner_attn(
             qkv,
-            key_padding_mask=key_padding_mask,
-            need_weights=need_weights,
+            # key_padding_mask=key_padding_mask,
+            # need_weights=need_weights,
             causal=self.causal,
         )
         return self.rearrange(qkv, "b s h d -> b (h d) s")
@@ -567,6 +575,7 @@ class UNetModel(nn.Module):
         use_scale_shift_norm=False,
         resblock_updown=False,
         use_new_attention_order=False,
+        cond='concat',
     ):
         super().__init__()
 
@@ -588,6 +597,7 @@ class UNetModel(nn.Module):
         self.num_heads = num_heads
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
+        self.cond = cond
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -600,6 +610,10 @@ class UNetModel(nn.Module):
             self.label_emb = nn.Embedding(num_classes, time_embed_dim)
 
         ch = input_ch = int(channel_mult[0] * model_channels)
+        if cond == 'concat':
+            ch = ch * 2
+            input_ch = in_channels * 2
+
         self.input_blocks = nn.ModuleList(
             [TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))]
         )
@@ -753,7 +767,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps, y=None):
+    def forward(self, x, timesteps, y=None, xT=None,):
         """
         Apply the model to an input batch.
 
@@ -762,6 +776,9 @@ class UNetModel(nn.Module):
         :param y: an [N] Tensor of labels, if class-conditional.
         :return: an [N x C x ...] Tensor of outputs.
         """
+        if cond == 'concat':
+            assert xT is not None
+            x = th.concat([x, xT], dim=1)
         assert (y is not None) == (
             self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"

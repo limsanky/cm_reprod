@@ -1,8 +1,11 @@
 """
 Train a diffusion model on images.
 """
-
 import argparse
+import os
+import sys
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.dirname(SCRIPT_DIR))
 
 from cm import dist_util, logger
 from cm.image_datasets import load_data
@@ -40,6 +43,8 @@ def main():
         distillation = False
     elif "consistency" in args.training_mode:
         distillation = True
+    elif args.training_mode == 'custom_isolation':
+        distillation = False
     else:
         raise ValueError(f"unknown training mode {args.training_mode}")
 
@@ -53,7 +58,8 @@ def main():
     if args.use_fp16:
         model.convert_to_fp16()
 
-    schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
+    schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion, 
+                                                    sigma_min=args.sigma_min, sigma_max=args.sigma_max)
 
     logger.log("creating data loader...")
     if args.batch_size == -1:
@@ -70,6 +76,7 @@ def main():
         batch_size=batch_size,
         image_size=args.image_size,
         class_cond=args.class_cond,
+        num_workers=args.num_workers,
     )
 
     if len(args.teacher_model_path) > 0:  # path to the teacher score model.
@@ -108,8 +115,9 @@ def main():
     target_model.to(dist_util.dev())
     target_model.train()
 
-    dist_util.sync_params(target_model.parameters())
-    dist_util.sync_params(target_model.buffers())
+    # dist_util.sync_params(target_model.parameters())
+    # dist_util.sync_params(target_model.buffers())
+    # dist.barrier()
 
     for dst, src in zip(target_model.parameters(), model.parameters()):
         dst.data.copy_(src.data)
@@ -140,6 +148,7 @@ def main():
         schedule_sampler=schedule_sampler,
         weight_decay=args.weight_decay,
         lr_anneal_steps=args.lr_anneal_steps,
+        sigma_max=args.sigma_max,
     ).run_loop()
 
 
@@ -159,6 +168,11 @@ def create_argparser():
         resume_checkpoint="",
         use_fp16=False,
         fp16_scale_growth=1e-3,
+        exp='',
+        dataset='cifar10',
+        num_workers=2,
+        debug=True,
+        wandb_offline=True,
     )
     defaults.update(model_and_diffusion_defaults())
     defaults.update(cm_train_defaults())

@@ -129,8 +129,9 @@ class TrainLoop:
                     ),
                 )
 
-        dist_util.sync_params(self.model.parameters())
-        dist_util.sync_params(self.model.buffers())
+        dist.barrier()
+        # dist_util.sync_params(self.model.parameters())
+        # dist_util.sync_params(self.model.buffers())
 
     def _load_ema_parameters(self, rate):
         ema_params = copy.deepcopy(self.mp_trainer.master_params)
@@ -145,7 +146,8 @@ class TrainLoop:
                 )
                 ema_params = self.mp_trainer.state_dict_to_master_params(state_dict)
 
-        dist_util.sync_params(ema_params)
+        # dist_util.sync_params(ema_params)
+        dist.barrier()
         return ema_params
 
     def _load_optimizer_state(self):
@@ -274,6 +276,7 @@ class CMTrainLoop(TrainLoop):
         training_mode,
         ema_scale_fn,
         total_training_steps,
+        sigma_max,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -283,7 +286,8 @@ class CMTrainLoop(TrainLoop):
         self.teacher_model = teacher_model
         self.teacher_diffusion = teacher_diffusion
         self.total_training_steps = total_training_steps
-
+        self.noise = None
+        self.sigma_max = sigma_max
         if target_model:
             self._load_and_sync_target_parameters()
             self.target_model.requires_grad_(False)
@@ -333,8 +337,9 @@ class CMTrainLoop(TrainLoop):
                     ),
                 )
 
-        dist_util.sync_params(self.target_model.parameters())
-        dist_util.sync_params(self.target_model.buffers())
+        # dist_util.sync_params(self.target_model.parameters())
+        # dist_util.sync_params(self.target_model.buffers())
+        dist.barrier()
 
     def _load_and_sync_teacher_parameters(self):
         resume_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
@@ -353,8 +358,9 @@ class CMTrainLoop(TrainLoop):
                     ),
                 )
 
-        dist_util.sync_params(self.teacher_model.parameters())
-        dist_util.sync_params(self.teacher_model.buffers())
+        # dist_util.sync_params(self.teacher_model.parameters())
+        # dist_util.sync_params(self.teacher_model.buffers())
+        dist.barrier()
 
     def run_loop(self):
         saved = False
@@ -363,8 +369,19 @@ class CMTrainLoop(TrainLoop):
             or self.step < self.lr_anneal_steps
             or self.global_step < self.total_training_steps
         ):
+            print('1')
             batch, cond = next(self.data)
+            print('2')
+            if self.noise is None:
+                self.noise = th.randn_like(batch) 
+            xT = batch + (self.noise * self.sigma_max)
+            if isinstance(cond, dict):
+                cond['xT'] = xT
+            else:
+                cond = {'xT': xT}
+            print('done')
             self.run_step(batch, cond)
+            print('done2')
             saved = False
             if (
                 self.global_step

@@ -14,21 +14,13 @@ from . import dist_util
 from .nn import mean_flat, append_dims, append_zero
 from .random_util import get_generator
 
-
-def get_weightings(weight_schedule, snrs, sigma_data):
-    if weight_schedule == "snr":
-        weightings = snrs
-    elif weight_schedule == "snr+1":
-        weightings = snrs + 1
-    elif weight_schedule == "karras":
-        weightings = snrs + 1.0 / sigma_data**2
-    elif weight_schedule == "truncated-snr":
-        weightings = th.clamp(snrs, min=1.0)
-    elif weight_schedule == "uniform":
-        weightings = th.ones_like(snrs)
-    else:
-        raise NotImplementedError()
-    return weightings
+def vp_logsnr(t, beta_d, beta_min):
+    t = th.as_tensor(t)
+    return - th.log((0.5 * beta_d * (t ** 2) + beta_min * t).exp() - 1)
+    
+def vp_logs(t, beta_d, beta_min):
+    t = th.as_tensor(t)
+    return -0.25 * t ** 2 * (beta_d) - 0.5 * t * beta_min
 
 
 class KarrasDenoiser:
@@ -41,6 +33,9 @@ class KarrasDenoiser:
         weight_schedule="karras",
         distillation=False,
         loss_norm="lpips",
+        sigma_data_end=None,
+        cov_xy=None,
+        is_n2i=True,
     ):
         self.sigma_data = sigma_data
         self.sigma_max = sigma_max
@@ -52,6 +47,10 @@ class KarrasDenoiser:
             self.lpips_loss = LPIPS(replace_pooling=True, reduction="none")
         self.rho = rho
         self.num_timesteps = 40
+        self.cov_xy = cov_xy
+        self.sigma_data_end = sigma_data_end
+        self.c = 1.0
+        self.is_n2i = is_n2i
 
     def get_snr(self, sigmas):
         return sigmas**-2
@@ -64,18 +63,98 @@ class KarrasDenoiser:
         c_out = sigma * self.sigma_data / (sigma**2 + self.sigma_data**2) ** 0.5
         c_in = 1 / (sigma**2 + self.sigma_data**2) ** 0.5
         return c_skip, c_out, c_in
+    
+    def get_ddbm_scalings(self, sigma):
+        assert th.all(sigma <= self.sigma_max), sigma[sigma > self.sigma_max]
 
-    def get_scalings_for_boundary_condition(self, sigma):
-        c_skip = self.sigma_data**2 / (
-            (sigma - self.sigma_min) ** 2 + self.sigma_data**2
-        )
-        c_out = (
-            (sigma - self.sigma_min)
-            * self.sigma_data
-            / (sigma**2 + self.sigma_data**2) ** 0.5
-        )
-        c_in = 1 / (sigma**2 + self.sigma_data**2) ** 0.5
-        return c_skip, c_out, c_in
+        if self.pred_mode == 've':
+            A = sigma**4 / self.sigma_max**4 * self.sigma_data_end**2 + (1 - sigma**2 / self.sigma_max**2)**2 * self.sigma_data**2 + 2*sigma**2 / self.sigma_max**2 * (1 - sigma**2 / self.sigma_max**2) * self.cov_xy + self.c **2 * sigma**2 * (1 - sigma**2 / self.sigma_max**2)
+            c_in = 1 / (A) ** 0.5
+            c_skip = ((1 - sigma**2 / self.sigma_max**2) * self.sigma_data**2 + sigma**2 / self.sigma_max**2 * self.cov_xy)/ A
+            c_out =((sigma/self.sigma_max)**4 * (self.sigma_data_end**2 * self.sigma_data**2 - self.cov_xy**2) + self.sigma_data**2 *  self.c **2 * sigma**2 * (1 - sigma**2/self.sigma_max**2) )**0.5 * c_in
+            return c_skip, c_out, c_in
+        
+        elif self.pred_mode == 'vp':
+
+            logsnr_t = vp_logsnr(sigma, self.beta_d, self.beta_min)
+            logsnr_T = vp_logsnr(1, self.beta_d, self.beta_min)
+            logs_t = vp_logs(sigma, self.beta_d, self.beta_min)
+            logs_T = vp_logs(1, self.beta_d, self.beta_min)
+
+            a_t = (logsnr_T - logsnr_t +logs_t -logs_T).exp()
+            b_t = -th.expm1(logsnr_T - logsnr_t) * logs_t.exp()
+            c_t = -th.expm1(logsnr_T - logsnr_t) * (2*logs_t - logsnr_t).exp()
+
+            A = a_t**2 * self.sigma_data_end**2 + b_t**2 * self.sigma_data**2 + 2*a_t * b_t * self.cov_xy + self.c**2 * c_t
+            
+            c_in = 1 / (A) ** 0.5
+            c_skip = (b_t * self.sigma_data**2 + a_t * self.cov_xy)/ A
+            c_out =(a_t**2 * (self.sigma_data_end**2 * self.sigma_data**2 - self.cov_xy**2) + self.sigma_data**2 *  self.c **2 * c_t )**0.5 * c_in
+            return c_skip, c_out, c_in
+
+        elif self.pred_mode == 've_simple' or self.pred_mode == 'vp_simple':
+            c_in = th.ones_like(sigma)
+            c_out = th.ones_like(sigma) 
+            c_skip = th.zeros_like(sigma)
+            return c_skip, c_out, c_in
+
+    def get_weightings(self, sigma, sigma_u=None, weight_schedule=None):
+        if weight_schedule is None:
+            weight_schedule = self.weight_schedule
+        snrs = self.get_snr(sigma)
+        
+        if weight_schedule in ['cm_bridge_karras', "cm_bridge_karras_x0", "cm_bridge_karras_until_x0"]:
+            assert sigma_u is not None, "sigma_u is None!"
+            weightings = 1 / (sigma - sigma_u)
+            assert (weightings > 0).all(), weightings
+        elif weight_schedule == "snr":
+            weightings = snrs
+        elif weight_schedule == "snr+1":
+            weightings = snrs + 1
+        elif weight_schedule == "karras":
+            weightings = snrs + 1.0 / self.sigma_data**2
+        elif weight_schedule.startswith("bridge_karras"):
+            if self.pred_mode == 've':
+                A = sigma**4 / self.sigma_max**4 * self.sigma_data_end**2 + (1 - sigma**2 / self.sigma_max**2)**2 * self.sigma_data**2 + 2*sigma**2 / self.sigma_max**2 * (1 - sigma**2 / self.sigma_max**2) * self.cov_xy + self.c**2 * sigma**2 * (1 - sigma**2 / self.sigma_max**2)
+                weightings = A / ((sigma/self.sigma_max)**4 * (self.sigma_data_end**2 * self.sigma_data**2 - self.cov_xy**2) + self.sigma_data**2 * self.c**2 * sigma**2 * (1 - sigma**2/self.sigma_max**2) )
+            
+            elif self.pred_mode == 'vp':
+                
+                logsnr_t = vp_logsnr(sigma, self.beta_d, self.beta_min)
+                logsnr_T = vp_logsnr(1, self.beta_d, self.beta_min)
+                logs_t = vp_logs(sigma, self.beta_d, self.beta_min)
+                logs_T = vp_logs(1, self.beta_d, self.beta_min)
+
+                a_t = (logsnr_T - logsnr_t +logs_t -logs_T).exp()
+                b_t = -th.expm1(logsnr_T - logsnr_t) * logs_t.exp()
+                c_t = -th.expm1(logsnr_T - logsnr_t) * (2*logs_t - logsnr_t).exp()
+
+                A = a_t**2 * self.sigma_data_end**2 + b_t**2 * self.sigma_data**2 + 2*a_t * b_t * self.cov_xy + self.c**2 * c_t
+                weightings = A / (a_t**2 * (self.sigma_data_end**2 * self.sigma_data**2 - self.cov_xy**2) + self.sigma_data**2 * self.c**2 * c_t )
+                
+            elif self.pred_mode == 'vp_simple' or  self.pred_mode == 've_simple':
+
+                weightings = th.ones_like(snrs)
+        elif weight_schedule == "truncated-snr":
+            weightings = th.clamp(snrs, min=1.0)
+        elif weight_schedule == "uniform":
+            weightings = th.ones_like(snrs)
+        else:
+            raise NotImplementedError()
+
+        return weightings
+    
+    # def get_scalings_for_boundary_condition(self, sigma):
+    #     c_skip = self.sigma_data**2 / (
+    #         (sigma - self.sigma_min) ** 2 + self.sigma_data**2
+    #     )
+    #     c_out = (
+    #         (sigma - self.sigma_min)
+    #         * self.sigma_data
+    #         / (sigma**2 + self.sigma_data**2) ** 0.5
+    #     )
+    #     c_in = 1 / (sigma**2 + self.sigma_data**2) ** 0.5
+    #     return c_skip, c_out, c_in
 
     def training_losses(self, model, x_start, sigmas, model_kwargs=None, noise=None):
         if model_kwargs is None:
@@ -89,9 +168,10 @@ class KarrasDenoiser:
         x_t = x_start + noise * append_dims(sigmas, dims)
         model_output, denoised = self.denoise(model, x_t, sigmas, **model_kwargs)
 
-        snrs = self.get_snr(sigmas)
+        # snrs = self.get_snr(sigmas)
         weights = append_dims(
-            get_weightings(self.weight_schedule, snrs, self.sigma_data), dims
+            # self.get_weightings(self.weight_schedule, snrs, self.sigma_data), dims
+            self.get_weightings(weight_schedule=self.weight_schedule, sigma=sigmas), dims
         )
         terms["xs_mse"] = mean_flat((denoised - x_start) ** 2)
         terms["mse"] = mean_flat(weights * (denoised - x_start) ** 2)
@@ -103,19 +183,53 @@ class KarrasDenoiser:
 
         return terms
 
+    def bridge_xt(
+        self,
+        x0,
+        xT,
+        t,
+        noise=None,
+    ):
+        dims = x0.ndim
+        if noise is None:
+            noise = th.randn_like(x0)
+        t = append_dims(t, dims)
+        if self.pred_mode == 've':
+            a_t = (t / self.sigma_max).square()
+            b_t = 1 - a_t
+            c_t = t * b_t
+            x_t = (a_t * xT) + (b_t * x0) + (noise * c_t.sqrt())
+            return x_t
+        elif self.pred_mode.startswith('vp'):
+            logsnr_t = vp_logsnr(t, self.beta_d, self.beta_min)
+            logsnr_T = vp_logsnr(self.sigma_max, self.beta_d, self.beta_min)
+            logs_t = vp_logs(t, self.beta_d, self.beta_min)
+            logs_T = vp_logs(self.sigma_max, self.beta_d, self.beta_min)
+
+            a_t = (logsnr_T - logsnr_t +logs_t -logs_T).exp()
+            b_t = -th.expm1(logsnr_T - logsnr_t) * logs_t.exp()
+            std_t = (-th.expm1(logsnr_T - logsnr_t)).sqrt() * (logs_t - logsnr_t/2).exp()
+            
+            samples= a_t * x_T + b_t * x_0 + std_t * noise
+            return x_t
+        else:
+            raise NotImplementedError()
+
     def consistency_losses(
         self,
         model,
         x_start,
         num_scales,
-        model_kwargs=None,
+        model_kwargs:dict=None,
         target_model=None,
         teacher_model=None,
         teacher_diffusion=None,
         noise=None,
     ):
-        if model_kwargs is None:
-            model_kwargs = {}
+        assert 'xT' in model_kwargs.keys()
+        xT = model_kwargs['xT']
+        # if model_kwargs is None:
+        #     model_kwargs = {}
         if noise is None:
             noise = th.randn_like(x_start)
 
@@ -185,22 +299,24 @@ class KarrasDenoiser:
         )
         t2 = t2**self.rho
 
-        x_t = x_start + noise * append_dims(t, dims)
+        # x_t = x_start + noise * append_dims(t, dims)
+        x_t = self.bridge_xt(x_start, xT, t, noise)
 
         dropout_state = th.get_rng_state()
         distiller = denoise_fn(x_t, t)
 
-        if teacher_model is None:
-            x_t2 = euler_solver(x_t, t, t2, x_start).detach()
-        else:
-            x_t2 = heun_solver(x_t, t, t2, x_start).detach()
+        # if teacher_model is None:
+        #     x_t2 = euler_solver(x_t, t, t2, x_start).detach()
+        # else:
+        #     x_t2 = heun_solver(x_t, t, t2, x_start).detach()
+        x_t2 = self.bridge_xt(x_start, xT, t2, noise)
 
         th.set_rng_state(dropout_state)
         distiller_target = target_denoise_fn(x_t2, t2)
         distiller_target = distiller_target.detach()
 
-        snrs = self.get_snr(t)
-        weights = get_weightings(self.weight_schedule, snrs, self.sigma_data)
+        # snrs = self.get_snr(t)
+        weights = self.get_weightings(weight_schedule=self.weight_schedule, sigma=t, sigma_u=t2)
         if self.loss_norm == "l1":
             diffs = th.abs(distiller - distiller_target)
             loss = mean_flat(diffs) * weights
@@ -304,8 +420,8 @@ class KarrasDenoiser:
 
         target_x = euler_to_denoiser(x_t, t, x_t3, t3).detach()
 
-        snrs = self.get_snr(t)
-        weights = get_weightings(self.weight_schedule, snrs, self.sigma_data)
+        # snrs = self.get_snr(t)
+        weights = self.get_weightings(weight_schedule=self.weight_schedule, sigma=t)
         if self.loss_norm == "l1":
             diffs = th.abs(denoised_x - target_x)
             loss = mean_flat(diffs) * weights
@@ -334,15 +450,16 @@ class KarrasDenoiser:
     def denoise(self, model, x_t, sigmas, **model_kwargs):
         import torch.distributed as dist
 
-        if not self.distillation:
-            c_skip, c_out, c_in = [
-                append_dims(x, x_t.ndim) for x in self.get_scalings(sigmas)
-            ]
-        else:
-            c_skip, c_out, c_in = [
-                append_dims(x, x_t.ndim)
-                for x in self.get_scalings_for_boundary_condition(sigmas)
-            ]
+        # if not self.distillation:
+        #     c_skip, c_out, c_in = [
+        #         append_dims(x, x_t.ndim) for x in self.get_scalings(sigmas)
+        #     ]
+        # else:
+        c_skip, c_out, c_in = [
+            append_dims(x, x_t.ndim)
+            # for x in self.get_scalings_for_boundary_condition(sigmas)
+            for x in self.get_ddbm_scalings(sigmas)
+        ]
         rescaled_t = 1000 * 0.25 * th.log(sigmas + 1e-44)
         model_output = model(c_in * x_t, rescaled_t, **model_kwargs)
         denoised = c_out * model_output + c_skip * x_t

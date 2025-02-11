@@ -17,6 +17,7 @@ def load_data(
     deterministic=False,
     random_crop=False,
     random_flip=True,
+    num_workers=2,
 ):
     """
     For a dataset, create a generator over (images, kwargs) pairs.
@@ -57,11 +58,11 @@ def load_data(
     )
     if deterministic:
         loader = DataLoader(
-            dataset, batch_size=batch_size, shuffle=False, num_workers=1, drop_last=True
+            dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, drop_last=True
         )
     else:
         loader = DataLoader(
-            dataset, batch_size=batch_size, shuffle=True, num_workers=1, drop_last=True
+            dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=True
         )
     while True:
         yield from loader
@@ -115,7 +116,8 @@ class ImageDataset(Dataset):
         if self.random_flip and random.random() < 0.5:
             arr = arr[:, ::-1]
 
-        arr = arr.astype(np.float32) / 127.5 - 1
+        # arr = arr.astype(np.float32) / 127.5 - 1
+        arr = arr.astype(np.float32) / 255.0
 
         out_dict = {}
         if self.local_classes is not None:

@@ -6,7 +6,7 @@ from scipy.stats import norm
 import torch.distributed as dist
 
 
-def create_named_schedule_sampler(name, diffusion):
+def create_named_schedule_sampler(name, diffusion, sigma_min=None, sigma_max=None, rho=7):
     """
     Create a ScheduleSampler from a library of pre-defined samplers.
 
@@ -19,6 +19,13 @@ def create_named_schedule_sampler(name, diffusion):
         return LossSecondMomentResampler(diffusion)
     elif name == "lognormal":
         return LogNormalSampler()
+    elif name in ["ictlognormal", "ictlognormal_x0"]:
+        assert sigma_min is not None
+        assert sigma_max is not None
+        assert rho is not None
+        if name == "ictlognormal_x0":
+            return ICTLogNormalSampler(diffusion, sigma_min=sigma_min, sigma_max=sigma_max, rho=rho, until_x0=True)
+        return ICTLogNormalSampler(diffusion, sigma_min=sigma_min, sigma_max=sigma_max, rho=rho)
     else:
         raise NotImplementedError(f"unknown schedule sampler: {name}")
 
@@ -178,3 +185,58 @@ class LogNormalSampler:
         sigmas = th.exp(log_sigmas)
         weights = th.ones_like(sigmas)
         return sigmas, weights
+
+class ICTLogNormalSampler:
+    def __init__(self, diffusion, p_mean=-1.1, p_std=2.0, sigma_min=0.002, sigma_max=80.0, rho=7, until_x0=False):
+        self.p_mean = p_mean
+        self.p_std = p_std     
+        self.sigma_max = sigma_max
+        self.sigma_min = sigma_min
+        self.rho = rho   
+        # print("sigma_max", self.sigma_max)
+        # print("sigma_min", self.sigma_min)
+        self.until_x0 = until_x0
+        
+    def sample_t_and_u(self, bs, num_steps, device):
+        
+        timesteps = th.arange(num_steps, device=device) / max(num_steps - 1, 1)
+        sigmas = (self.sigma_min ** (1 / self.rho) + timesteps * (
+            self.sigma_max ** (1 / self.rho) - self.sigma_min ** (1 / self.rho)
+        )) ** self.rho
+        
+        # sigmas[0] = th.ones_like(sigmas[0]) * self.sigma_min
+        # sigmas[-1] = th.ones_like(sigmas[-1]) * self.sigma_max
+        sigmas = sigmas.clamp(min=self.sigma_min, max=self.sigma_max)
+        
+        if self.until_x0:
+            sigmas = th.from_numpy(np.concatenate(([0.0], sigmas.cpu().numpy()))).to(device)
+        
+        pdf = th.erf((th.log(sigmas[1:]) - self.p_mean) / (self.p_std * np.sqrt(2))) - th.erf(
+            (th.log(sigmas[:-1]) - self.p_mean) / (self.p_std * np.sqrt(2))
+        )
+        pdf = pdf / pdf.sum()
+        u = th.multinomial(pdf, bs, replacement=True)
+        t = u + 1
+        
+        # sigmas = th.where(condition = sigmas < self.sigma_min, input = th.ones_like(sigmas) * self.sigma_min, other = sigmas)
+        
+        # assert (t < len(sigmas)).all(), u
+        # print(sigmas)
+        # print(t)
+        # print(u)
+        sigma_t = sigmas[t]
+        sigma_u = sigmas[u]
+        # weights = th.ones_like(sigmas)
+        # assert th.all(sigma_t <= self.sigma_max), f"Error: sigma_t is not greater than {self.sigma_max}!"
+        
+        assert th.all(sigma_t > sigma_u), "Error: sigma_t is not greater than sigma_u!"
+        # if not th.all(sigma_u >= self.sigma_min):
+        #     sigma_u[sigma_u < self.sigma_min] = self.sigma_min
+        #     sigma_u.clamp(self.sigma_min, self.sigma_max)
+        if not self.until_x0:
+            assert th.all(sigma_u >= self.sigma_min)
+        # print('sigma t', sigma_t.unique())
+        # print('sigma u', sigma_u.unique())
+        # exit()
+        weights = th.ones_like(sigma_t)
+        return sigma_t, weights, sigma_u
