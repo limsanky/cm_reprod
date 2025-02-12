@@ -4,8 +4,11 @@ from .karras_diffusion import KarrasDenoiser
 from .unet import UNetModel
 import numpy as np
 
-NUM_CLASSES = 1000
+NUM_CLASSES = 10
 
+def get_workdir(exp):
+    workdir = f'./workdir/{exp}'
+    return workdir
 
 def cm_train_defaults():
     return dict(
@@ -20,7 +23,6 @@ def cm_train_defaults():
         end_scales=40,
         distill_steps_per_iter=50000,
         loss_norm="lpips",
-        pred_mode='ve',
     )
 
 
@@ -52,6 +54,7 @@ def model_and_diffusion_defaults():
         weight_schedule="cm_bridge_karras_until_x0",
         is_n2i=True,
         condition_mode='concat',
+        pred_mode='ve',
     )
     return res
 
@@ -82,6 +85,7 @@ def create_model_and_diffusion(
     cov_xy=0.0,
     is_n2i=True,
     condition_mode='concat',
+    pred_mode='ve',
 ):
     model = create_model(
         image_size,
@@ -115,6 +119,7 @@ def create_model_and_diffusion(
         sigma_data_end=sigma_data_end,
         cov_xy=cov_xy,
         is_n2i=is_n2i,
+        pred_mode=pred_mode,
     )
     return model, diffusion
 

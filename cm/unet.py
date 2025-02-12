@@ -610,9 +610,7 @@ class UNetModel(nn.Module):
             self.label_emb = nn.Embedding(num_classes, time_embed_dim)
 
         ch = input_ch = int(channel_mult[0] * model_channels)
-        if cond == 'concat':
-            ch = ch * 2
-            input_ch = in_channels * 2
+        in_channels = in_channels * 2 if cond == 'concat' else in_channels
 
         self.input_blocks = nn.ModuleList(
             [TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))]
@@ -758,6 +756,7 @@ class UNetModel(nn.Module):
         self.input_blocks.apply(convert_module_to_f16)
         self.middle_block.apply(convert_module_to_f16)
         self.output_blocks.apply(convert_module_to_f16)
+        self.out.apply(convert_module_to_f16)
 
     def convert_to_fp32(self):
         """
@@ -766,6 +765,7 @@ class UNetModel(nn.Module):
         self.input_blocks.apply(convert_module_to_f32)
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
+        self.out.apply(convert_module_to_f32)
 
     def forward(self, x, timesteps, y=None, xT=None,):
         """
@@ -776,7 +776,7 @@ class UNetModel(nn.Module):
         :param y: an [N] Tensor of labels, if class-conditional.
         :return: an [N x C x ...] Tensor of outputs.
         """
-        if cond == 'concat':
+        if self.cond == 'concat':
             assert xT is not None
             x = th.concat([x, xT], dim=1)
         assert (y is not None) == (
@@ -798,5 +798,5 @@ class UNetModel(nn.Module):
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
             h = module(h, emb)
-        h = h.type(x.dtype)
+        # h = h.type(x.dtype)
         return self.out(h)

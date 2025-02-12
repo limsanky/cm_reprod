@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from piq import LPIPS
 from torchvision.transforms import RandomCrop
 from . import dist_util
-
+import math 
 from .nn import mean_flat, append_dims, append_zero
 from .random_util import get_generator
 
@@ -36,6 +36,7 @@ class KarrasDenoiser:
         sigma_data_end=None,
         cov_xy=None,
         is_n2i=True,
+        pred_mode='ve',
     ):
         self.sigma_data = sigma_data
         self.sigma_max = sigma_max
@@ -43,6 +44,7 @@ class KarrasDenoiser:
         self.weight_schedule = weight_schedule
         self.distillation = distillation
         self.loss_norm = loss_norm
+        self.pred_mode = pred_mode
         if loss_norm == "lpips":
             self.lpips_loss = LPIPS(replace_pooling=True, reduction="none")
         self.rho = rho
@@ -346,6 +348,152 @@ class KarrasDenoiser:
                 )
                 * weights
             )
+        else:
+            raise ValueError(f"Unknown loss norm {self.loss_norm}")
+
+        terms = {}
+        terms["loss"] = loss
+
+        return terms
+
+    def custom_consistency_losses(
+        self,
+        model,
+        x_start,
+        num_scales,
+        sigma_t,
+        sigma_u,
+        model_kwargs:dict=None,
+        target_model=None,
+        teacher_model=None,
+        teacher_diffusion=None,
+        noise=None,
+        
+    ):
+        assert 'xT' in model_kwargs.keys()
+        xT = model_kwargs['xT']
+        # if model_kwargs is None:
+        #     model_kwargs = {}
+        if noise is None:
+            noise = th.randn_like(x_start)
+
+        dims = x_start.ndim
+
+        def denoise_fn(x, t):
+            return self.denoise(model, x, t, **model_kwargs)[1]
+
+        if target_model:
+
+            @th.no_grad()
+            def target_denoise_fn(x, t):
+                return self.denoise(target_model, x, t, **model_kwargs)[1]
+
+        else:
+            raise NotImplementedError("Must have a target model")
+
+        if teacher_model:
+
+            @th.no_grad()
+            def teacher_denoise_fn(x, t):
+                return teacher_diffusion.denoise(teacher_model, x, t, **model_kwargs)[1]
+
+        @th.no_grad()
+        def heun_solver(samples, t, next_t, x0):
+            x = samples
+            if teacher_model is None:
+                denoiser = x0
+            else:
+                denoiser = teacher_denoise_fn(x, t)
+
+            d = (x - denoiser) / append_dims(t, dims)
+            samples = x + d * append_dims(next_t - t, dims)
+            if teacher_model is None:
+                denoiser = x0
+            else:
+                denoiser = teacher_denoise_fn(samples, next_t)
+
+            next_d = (samples - denoiser) / append_dims(next_t, dims)
+            samples = x + (d + next_d) * append_dims((next_t - t) / 2, dims)
+
+            return samples
+
+        @th.no_grad()
+        def euler_solver(samples, t, next_t, x0):
+            x = samples
+            if teacher_model is None:
+                denoiser = x0
+            else:
+                denoiser = teacher_denoise_fn(x, t)
+            d = (x - denoiser) / append_dims(t, dims)
+            samples = x + d * append_dims(next_t - t, dims)
+
+            return samples
+
+        # indices = th.randint(
+        #     0, num_scales - 1, (x_start.shape[0],), device=x_start.device
+        # )
+
+        # t = self.sigma_max ** (1 / self.rho) + indices / (num_scales - 1) * (
+        #     self.sigma_min ** (1 / self.rho) - self.sigma_max ** (1 / self.rho)
+        # )
+        # t = t**self.rho
+
+        # t2 = self.sigma_max ** (1 / self.rho) + (indices + 1) / (num_scales - 1) * (
+        #     self.sigma_min ** (1 / self.rho) - self.sigma_max ** (1 / self.rho)
+        # )
+        # t2 = t2**self.rho
+        t = sigma_t
+        t2 = sigma_u
+        # x_t = x_start + noise * append_dims(t, dims)
+        x_t = self.bridge_xt(x_start, xT, t, noise)
+
+        dropout_state = th.get_rng_state()
+        distiller = denoise_fn(x_t, t)
+
+        # if teacher_model is None:
+        #     x_t2 = euler_solver(x_t, t, t2, x_start).detach()
+        # else:
+        #     x_t2 = heun_solver(x_t, t, t2, x_start).detach()
+        x_t2 = self.bridge_xt(x_start, xT, t2, noise)
+
+        th.set_rng_state(dropout_state)
+        distiller_target = target_denoise_fn(x_t2, t2)
+        distiller_target = distiller_target.detach()
+
+        # snrs = self.get_snr(t)
+        weights = self.get_weightings(weight_schedule=self.weight_schedule, sigma=t, sigma_u=t2)
+        if self.loss_norm == "l1":
+            diffs = th.abs(distiller - distiller_target)
+            loss = mean_flat(diffs) * weights
+        elif self.loss_norm == "l2":
+            diffs = (distiller - distiller_target) ** 2
+            loss = mean_flat(diffs) * weights
+        elif self.loss_norm == "l2-32":
+            distiller = F.interpolate(distiller, size=32, mode="bilinear")
+            distiller_target = F.interpolate(
+                distiller_target,
+                size=32,
+                mode="bilinear",
+            )
+            diffs = (distiller - distiller_target) ** 2
+            loss = mean_flat(diffs) * weights
+        elif self.loss_norm == "lpips":
+            if x_start.shape[-1] < 256:
+                distiller = F.interpolate(distiller, size=224, mode="bilinear")
+                distiller_target = F.interpolate(
+                    distiller_target, size=224, mode="bilinear"
+                )
+
+            loss = (
+                self.lpips_loss(
+                    (distiller + 1) / 2.0,
+                    (distiller_target + 1) / 2.0,
+                )
+                * weights
+            )
+        elif self.loss_norm == "ph":
+            c = 0.00054 * math.sqrt(math.prod(x_start.shape[1:]))
+            loss = th.sqrt(th.square(distiller - distiller_target) + (c**2)) - c
         else:
             raise ValueError(f"Unknown loss norm {self.loss_norm}")
 

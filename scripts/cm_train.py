@@ -17,17 +17,22 @@ from cm.script_util import (
     args_to_dict,
     add_dict_to_argparser,
     create_ema_and_scales_fn,
+    get_workdir
 )
 from cm.train_util import CMTrainLoop
 import torch.distributed as dist
 import copy
-
+from pathlib import Path
 
 def main():
     args = create_argparser().parse_args()
 
+    workdir = get_workdir(args.exp)
+    Path(workdir).mkdir(parents=True, exist_ok=True)
+    (Path(workdir) / 'images').mkdir(parents=True, exist_ok=True)
+
     dist_util.setup_dist()
-    logger.configure()
+    logger.configure(dir=workdir)
 
     logger.log("creating model and diffusion...")
     ema_scale_fn = create_ema_and_scales_fn(
@@ -55,6 +60,7 @@ def main():
     model, diffusion = create_model_and_diffusion(**model_and_diffusion_kwargs)
     model.to(dist_util.dev())
     model.train()
+
     if args.use_fp16:
         model.convert_to_fp16()
 
@@ -72,6 +78,7 @@ def main():
         batch_size = args.batch_size
 
     data = load_data(
+        datasetname=args.datasetname,
         data_dir=args.data_dir,
         batch_size=batch_size,
         image_size=args.image_size,
@@ -117,7 +124,7 @@ def main():
 
     # dist_util.sync_params(target_model.parameters())
     # dist_util.sync_params(target_model.buffers())
-    # dist.barrier()
+    dist.barrier()
 
     for dst, src in zip(target_model.parameters(), model.parameters()):
         dst.data.copy_(src.data)
@@ -155,6 +162,7 @@ def main():
 def create_argparser():
     defaults = dict(
         data_dir="",
+        datasetname='cifar10',
         schedule_sampler="uniform",
         lr=1e-4,
         weight_decay=0.0,
@@ -163,7 +171,7 @@ def create_argparser():
         batch_size=-1,
         microbatch=-1,  # -1 disables microbatches
         ema_rate="0.9999",  # comma-separated list of EMA values
-        log_interval=10,
+        log_interval=50,
         save_interval=10000,
         resume_checkpoint="",
         use_fp16=False,

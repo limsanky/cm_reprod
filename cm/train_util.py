@@ -1,17 +1,19 @@
 import copy
 import functools
 import os
+import datetime
 
 import blobfile as bf
 import torch as th
 import torch.distributed as dist
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import RAdam
+from torchsummary import summary
 
 from . import dist_util, logger
 from .fp16_util import MixedPrecisionTrainer
 from .nn import update_ema
-from .resample import LossAwareSampler, UniformSampler
+from .resample import LossAwareSampler, UniformSampler, ICTLogNormalSampler
 
 from .fp16_util import (
     get_param_groups_and_shapes,
@@ -71,7 +73,6 @@ class TrainLoop:
         self.global_batch = self.batch_size * dist.get_world_size()
 
         self.sync_cuda = th.cuda.is_available()
-
         self._load_and_sync_parameters()
         self.mp_trainer = MixedPrecisionTrainer(
             model=self.model,
@@ -94,17 +95,22 @@ class TrainLoop:
                 copy.deepcopy(self.mp_trainer.master_params)
                 for _ in range(len(self.ema_rate))
             ]
-
+        
         if th.cuda.is_available():
             self.use_ddp = True
-            self.ddp_model = DDP(
-                self.model,
-                device_ids=[dist_util.dev()],
-                output_device=dist_util.dev(),
-                broadcast_buffers=False,
-                bucket_cap_mb=128,
-                find_unused_parameters=False,
-            )
+            try:
+                # print('dist_util.dev():', dist_util.dev())
+                # exit()
+                self.ddp_model = DDP(
+                    self.model,
+                    device_ids=[dist_util.dev()],
+                    output_device=dist_util.dev(),
+                    broadcast_buffers=False,
+                    bucket_cap_mb=128,
+                    find_unused_parameters=False,
+                )
+            except:
+                print('error')
         else:
             if dist.get_world_size() > 1:
                 logger.warn(
@@ -129,9 +135,9 @@ class TrainLoop:
                     ),
                 )
 
-        dist.barrier()
-        # dist_util.sync_params(self.model.parameters())
-        # dist_util.sync_params(self.model.buffers())
+        # dist.barrier()
+        dist_util.sync_params(self.model.parameters())
+        dist_util.sync_params(self.model.buffers())
 
     def _load_ema_parameters(self, rate):
         ema_params = copy.deepcopy(self.mp_trainer.master_params)
@@ -146,8 +152,8 @@ class TrainLoop:
                 )
                 ema_params = self.mp_trainer.state_dict_to_master_params(state_dict)
 
-        # dist_util.sync_params(ema_params)
-        dist.barrier()
+        dist_util.sync_params(ema_params)
+        # dist.barrier()
         return ema_params
 
     def _load_optimizer_state(self):
@@ -186,8 +192,19 @@ class TrainLoop:
         self._anneal_lr()
         self.log_step()
 
-    def forward_backward(self, batch, cond):
-        self.mp_trainer.zero_grad()
+    def forward_backward(self, batch, cond, train=True):
+        if train:
+            self.ddp_model.train()
+            self.mp_trainer.zero_grad()
+        else:
+            self.ddp_model.eval()
+            model_stats = summary(self.ddp_model, (1, 3, self.data_image_size, self.data_image_size), batch_dim=None, device=self.device, verbose=0, xT=th.ones((1, 3, self.data_image_size, self.data_image_size)), timestep=th.Tensor([0.52]))
+            with open(f'{self.workdir}/model_info.txt', mode='w') as f:
+                f.write('-'*20 + '\n')
+                f.write(str(model_stats))
+                f.write('-'*20 + '\n')
+                if dist.get_rank() == 0:
+                    print(str(model_stats))
         for i in range(0, batch.shape[0], self.microbatch):
             micro = batch[i : i + self.microbatch].to(dist_util.dev())
             micro_cond = {
@@ -288,6 +305,7 @@ class CMTrainLoop(TrainLoop):
         self.total_training_steps = total_training_steps
         self.noise = None
         self.sigma_max = sigma_max
+        self.original_num_steps = 0
         if target_model:
             self._load_and_sync_target_parameters()
             self.target_model.requires_grad_(False)
@@ -337,9 +355,9 @@ class CMTrainLoop(TrainLoop):
                     ),
                 )
 
-        # dist_util.sync_params(self.target_model.parameters())
-        # dist_util.sync_params(self.target_model.buffers())
-        dist.barrier()
+        dist_util.sync_params(self.target_model.parameters())
+        dist_util.sync_params(self.target_model.buffers())
+        # dist.barrier()
 
     def _load_and_sync_teacher_parameters(self):
         resume_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
@@ -358,9 +376,9 @@ class CMTrainLoop(TrainLoop):
                     ),
                 )
 
-        # dist_util.sync_params(self.teacher_model.parameters())
-        # dist_util.sync_params(self.teacher_model.buffers())
-        dist.barrier()
+        dist_util.sync_params(self.teacher_model.parameters())
+        dist_util.sync_params(self.teacher_model.buffers())
+        # dist.barrier()
 
     def run_loop(self):
         saved = False
@@ -369,9 +387,7 @@ class CMTrainLoop(TrainLoop):
             or self.step < self.lr_anneal_steps
             or self.global_step < self.total_training_steps
         ):
-            print('1')
             batch, cond = next(self.data)
-            print('2')
             if self.noise is None:
                 self.noise = th.randn_like(batch) 
             xT = batch + (self.noise * self.sigma_max)
@@ -379,9 +395,9 @@ class CMTrainLoop(TrainLoop):
                 cond['xT'] = xT
             else:
                 cond = {'xT': xT}
-            print('done')
+
             self.run_step(batch, cond)
-            print('done2')
+
             saved = False
             if (
                 self.global_step
@@ -397,6 +413,7 @@ class CMTrainLoop(TrainLoop):
 
             if self.global_step % self.log_interval == 0:
                 logger.dumpkvs()
+                logger.log(datetime.datetime.now().strftime("Time: %Y-%m-%d %H-%M-%S"))
 
         # Save the last checkpoint if it wasn't already saved.
         if not saved:
@@ -467,9 +484,19 @@ class CMTrainLoop(TrainLoop):
                 for k, v in cond.items()
             }
             last_batch = (i + self.microbatch) >= batch.shape[0]
-            t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
 
             ema, num_scales = self.ema_scale_fn(self.global_step)
+            if num_scales > self.original_num_steps:
+                logger.log(f'\nNumber of Steps increased from {self.original_num_steps} to {num_scales}.\n')
+                self.original_num_steps = num_scales
+
+            if isinstance(self.schedule_sampler, ICTLogNormalSampler):
+                t, weights, u = self.schedule_sampler.sample_t_and_u(
+                    micro.shape[0], num_scales, dist_util.dev()
+                )
+            else:
+                t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
+
             if self.training_mode == "progdist":
                 if num_scales == self.ema_scale_fn(0)[1]:
                     compute_losses = functools.partial(
@@ -511,6 +538,17 @@ class CMTrainLoop(TrainLoop):
                     target_model=self.target_model,
                     model_kwargs=micro_cond,
                 )
+            elif self.training_mode == 'custom_isolation':
+                compute_losses = functools.partial(
+                    self.diffusion.custom_consistency_losses,
+                    self.ddp_model,
+                    micro,
+                    num_scales,
+                    sigma_t=t,
+                    sigma_u=u,
+                    target_model=self.target_model,
+                    model_kwargs=micro_cond,
+                )
             else:
                 raise ValueError(f"Unknown training mode {self.training_mode}")
 
@@ -528,7 +566,8 @@ class CMTrainLoop(TrainLoop):
             loss = (losses["loss"] * weights).mean()
 
             log_loss_dict(
-                self.diffusion, t, {k: v * weights for k, v in losses.items()}
+                self.diffusion, t, {k: v * weights for k, v in losses.items()},
+                curr_step=self.step, log_interval=self.log_interval,
             )
             self.mp_trainer.backward(loss)
 
@@ -574,7 +613,7 @@ class CMTrainLoop(TrainLoop):
         # Save model parameters last to prevent race conditions where a restart
         # loads model at step N, but opt/ema state isn't saved for step N.
         save_checkpoint(0, self.mp_trainer.master_params)
-        dist.barrier()
+        # dist.barrier()
 
     def log_step(self):
         step = self.global_step
@@ -619,10 +658,16 @@ def find_ema_checkpoint(main_checkpoint, step, rate):
     return None
 
 
-def log_loss_dict(diffusion, ts, losses):
+def log_loss_dict(diffusion, ts, losses, curr_step, log_interval, accelerator=None):
+    dictionary = {}
     for key, values in losses.items():
-        logger.logkv_mean(key, values.mean().item())
-        # Log the quantiles (four quartiles, in particular).
-        for sub_t, sub_loss in zip(ts.cpu().numpy(), values.detach().cpu().numpy()):
-            quartile = int(4 * sub_t / diffusion.num_timesteps)
-            logger.logkv_mean(f"{key}_q{quartile}", sub_loss)
+        dictionary[key] = values.mean().item()
+        logger.logkv_mean(key, dictionary[key])
+
+# def log_loss_dict(diffusion, ts, losses):
+#     for key, values in losses.items():
+#         logger.logkv_mean(key, values.mean().item())
+#         # Log the quantiles (four quartiles, in particular).
+#         for sub_t, sub_loss in zip(ts.cpu().numpy(), values.detach().cpu().numpy()):
+#             quartile = int(4 * sub_t / diffusion.num_timesteps)
+#             logger.logkv_mean(f"{key}_q{quartile}", sub_loss)

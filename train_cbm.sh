@@ -6,7 +6,7 @@ CKPT=$3
 source ./args.sh $DATASET_NAME $PRED
 
 UNET=cbm_unet
-DATA_DIR=/root/data/cifar10/cifar-10-batches-py/
+DATA_DIR=/root/data/cifar10/
 DATASET=cifar10
 DATE=0212
 USE_16FP=True
@@ -20,7 +20,7 @@ ATTN=2,4
 # IMG_SIZE=256
 # BS=32
 IMG_SIZE=32
-BS=256
+BS=32
 
 EXP="${DATE}/cbm/$PRED/cif10_${IMG_SIZE}"
 
@@ -50,8 +50,10 @@ LR=0.0001
 EMA_RATE=0.9993
 
 WANDB_OFFLINE=True
+LOSS_NORM=ph
 
 SOME_FLAGS="
+--datasetname=${DATASET_NAME}
 --data_dir=${DATA_DIR} 
 --dataset=${DATASET} 
 ${CH_MULT:+ --channel_mult="${CH_MULT}"}
@@ -65,8 +67,10 @@ ${CH_MULT:+ --channel_mult="${CH_MULT}"}
 --global_batch_size=$GLOBAL_BS
 ${CKPT:+ --resume_checkpoint="${CKPT}"} 
 --is_n2i=$IS_N2I
+--loss_norm=${LOSS_NORM}
 "
 WANDB_OFFLINE=True
+
 WANDB_MODE=offline NCCL_P2P_DISABLE=1 CUDA_LAUNCH_BLOCKING=1 OMPI_MCA_opal_cuda_support=true CUDA_VISIBLE_DEVICES=${CUDA_IDX} mpiexec --allow-run-as-root -n $NGPU python scripts/cm_train.py --exp=$EXP \
  --attention_resolutions $ATTN --class_cond False --use_scale_shift_norm True \
   --dropout 0.1 --ema_rate $EMA_RATE --batch_size $BS \

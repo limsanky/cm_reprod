@@ -322,9 +322,9 @@ def profile(n):
 # ================================================================
 
 
-def get_current():
+def get_current(dir=None, accelerator=None):
     if Logger.CURRENT is None:
-        _configure_default_logger()
+        _configure_default_logger(dir=dir, accelerator=accelerator)
 
     return Logger.CURRENT
 
@@ -439,7 +439,7 @@ def mpi_weighted_mean(comm, local_name2valcount):
         return {}
 
 
-def configure(dir=None, format_strs=None, comm=None, log_suffix=""):
+def configure(dir=None, format_strs=None, comm=None, log_suffix="", accelerator=None):
     """
     If comm is provided, average all numerical stats across that comm
     """
@@ -454,15 +454,20 @@ def configure(dir=None, format_strs=None, comm=None, log_suffix=""):
     dir = os.path.expanduser(dir)
     os.makedirs(os.path.expanduser(dir), exist_ok=True)
 
-    rank = get_rank_without_mpi_import()
+    if accelerator is None:
+        rank = get_rank_without_mpi_import()
+    else:
+        rank = accelerator.process_index
     if rank > 0:
         log_suffix = log_suffix + "-rank%03i" % rank
 
     if format_strs is None:
         if rank == 0:
-            format_strs = os.getenv("OPENAI_LOG_FORMAT", "stdout,log,csv").split(",")
+            # format_strs = os.getenv("OPENAI_LOG_FORMAT", "stdout,log,csv").split(",")
+            format_strs = "stdout,log,csv".split(",")
         else:
-            format_strs = os.getenv("OPENAI_LOG_FORMAT_MPI", "log").split(",")
+            # format_strs = os.getenv("OPENAI_LOG_FORMAT_MPI", "log").split(",")
+            format_strs = ['log']
     format_strs = filter(None, format_strs)
     output_formats = [make_output_format(f, dir, log_suffix) for f in format_strs]
 
@@ -471,8 +476,8 @@ def configure(dir=None, format_strs=None, comm=None, log_suffix=""):
         log("Logging to %s" % dir)
 
 
-def _configure_default_logger():
-    configure()
+def _configure_default_logger(dir, accelerator):
+    configure(dir=dir, accelerator=accelerator)
     Logger.DEFAULT = Logger.CURRENT
 
 
